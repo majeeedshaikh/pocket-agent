@@ -427,7 +427,7 @@ def colab_smoke_test():
     t0 = time.time()
     try:
         model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name="unsloth/Qwen3-0.6B-Instruct",
+            model_name="Qwen/Qwen3-0.6B-Instruct",
             max_seq_length=512,
             load_in_4bit=True,
             dtype=None,
