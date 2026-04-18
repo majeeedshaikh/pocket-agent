@@ -1,0 +1,46 @@
+{
+  "tools": [
+    {
+      "name": "weather",
+      "description": "Get current weather for a location",
+      "args": {
+        "location": {"type": "string", "required": true, "description": "City name or location"},
+        "unit": {"type": "string", "required": true, "enum": ["C", "F"], "description": "Temperature unit: C for Celsius, F for Fahrenheit"}
+      }
+    },
+    {
+      "name": "calendar",
+      "description": "List or create calendar events",
+      "args": {
+        "action": {"type": "string", "required": true, "enum": ["list", "create"], "description": "Action to perform: list events or create a new event"},
+        "date": {"type": "string", "required": true, "format": "YYYY-MM-DD", "description": "Date for the calendar action"},
+        "title": {"type": "string", "required": false, "description": "Event title (required for create action)"}
+      }
+    },
+    {
+      "name": "convert",
+      "description": "Convert a value between units (length, weight, temperature, volume, speed, etc.)",
+      "args": {
+        "value": {"type": "number", "required": true, "description": "Numeric value to convert"},
+        "from_unit": {"type": "string", "required": true, "description": "Source unit (e.g. km, miles, kg, lbs, C, F)"},
+        "to_unit": {"type": "string", "required": true, "description": "Target unit (e.g. km, miles, kg, lbs, C, F)"}
+      }
+    },
+    {
+      "name": "currency",
+      "description": "Convert an amount between currencies using current exchange rates",
+      "args": {
+        "amount": {"type": "number", "required": true, "description": "Amount to convert"},
+        "from": {"type": "string", "required": true, "description": "Source currency ISO 4217 code (e.g. USD, EUR, GBP, JPY)"},
+        "to": {"type": "string", "required": true, "description": "Target currency ISO 4217 code (e.g. USD, EUR, GBP, JPY)"}
+      }
+    },
+    {
+      "name": "sql",
+      "description": "Execute a SQL query against the local database",
+      "args": {
+        "query": {"type": "string", "required": true, "description": "Valid SQL query string"}
+      }
+    }
+  ]
+}

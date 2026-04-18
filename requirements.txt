@@ -1,0 +1,9 @@
+# Inference + demo (CPU runtime, no GPU required)
+llama-cpp-python>=0.2.90
+gradio>=4.0.0
+
+# Data generation
+openai>=1.0.0
+
+# Evaluation
+# (uses only stdlib + inference.py)

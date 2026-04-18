@@ -1,0 +1,21 @@
+# LibreOffice lock files
+.~lock.*
+
+# Model artifacts (too large for git — use HuggingFace Hub or git-lfs)
+artifacts/adapter/
+artifacts/*.gguf
+artifacts/checkpoints/
+artifacts/gate_check.json
+
+# Generated training data (reproducible via make data)
+data/training_data.jsonl
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store

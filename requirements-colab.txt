@@ -1,0 +1,20 @@
+# Colab T4 training dependencies
+# Install with: pip install -r requirements-colab.txt
+
+# Unsloth — 2x faster fine-tuning, 60% less VRAM
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+
+# Training
+trl>=0.8.0
+datasets>=2.14.0
+transformers>=4.40.0
+accelerate>=0.28.0
+peft>=0.10.0
+bitsandbytes>=0.43.0
+
+# Data generation
+openai>=1.0.0
+
+# Inference + demo
+llama-cpp-python>=0.2.90
+gradio>=4.0.0
