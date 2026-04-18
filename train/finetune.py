@@ -20,7 +20,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/training_data.jsonl")
     p.add_argument("--output", default="artifacts/adapter")
-    p.add_argument("--model", default="Qwen/Qwen3-0.6B-Instruct")
+    p.add_argument("--model", default="unsloth/Qwen3-0.6B")
     p.add_argument("--max-steps", type=int, default=500)
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--batch-size", type=int, default=4)

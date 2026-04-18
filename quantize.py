@@ -30,12 +30,12 @@ def get_base_model(adapter_path: Path) -> str:
     meta_path = adapter_path / "training_meta.json"
     if meta_path.exists():
         meta = json.loads(meta_path.read_text())
-        return meta.get("base_model", "unsloth/Qwen3-0.6B-Instruct")
+        return meta.get("base_model", "unsloth/Qwen3-0.6B")
     config_path = adapter_path / "adapter_config.json"
     if config_path.exists():
         cfg = json.loads(config_path.read_text())
-        return cfg.get("base_model_name_or_path", "unsloth/Qwen3-0.6B-Instruct")
-    return "unsloth/Qwen3-0.6B-Instruct"
+        return cfg.get("base_model_name_or_path", "unsloth/Qwen3-0.6B")
+    return "unsloth/Qwen3-0.6B"
 
 
 def main():
