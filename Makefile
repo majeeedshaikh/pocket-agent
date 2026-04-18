@@ -47,6 +47,12 @@ demo-share:
 
 # ── Validation ────────────────────────────────────────────────────────────────
 
+sanity-local:
+	python sanity_check.py --local
+
+sanity-colab:
+	python sanity_check.py --colab
+
 check-gates:
 	@echo "=== Hard Gate Checks ==="
 	@python -c "from pathlib import Path; f=list(Path('artifacts').glob('*.gguf')); \
