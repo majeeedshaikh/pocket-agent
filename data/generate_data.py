@@ -1,10 +1,11 @@
 """
 Synthetic training data generator for Pocket-Agent.
-Uses GPT-4o-mini as teacher LLM to generate 1,500 diverse examples.
+Uses GPT-4o-mini as teacher LLM to generate ~1,500 diverse, correct examples.
 
 Usage:
     export OPENAI_API_KEY=sk-...
     python data/generate_data.py [--count 1500] [--out data/training_data.jsonl]
+    python data/generate_data.py --no-api   # free, rule-based only
 """
 
 import argparse
@@ -22,150 +23,119 @@ except ImportError:
     raise SystemExit("pip install openai")
 
 ROOT = Path(__file__).parent.parent
-SCHEMAS = json.loads((ROOT / "data" / "tool_schemas.json").read_text())
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+# This exact prompt is used BOTH in training data AND at inference time.
+# Precision here directly determines grading accuracy.
 
 SYSTEM_PROMPT = """\
-You are Pocket-Agent, a compact mobile assistant. You have access to exactly these five tools:
+You are Pocket-Agent, a compact offline mobile assistant. You have access to exactly five tools:
 
-weather   – args: location (string), unit ("C" or "F")
-calendar  – args: action ("list" or "create"), date (YYYY-MM-DD), title (string, only for create)
-convert   – args: value (number), from_unit (string), to_unit (string)
-currency  – args: amount (number), from (ISO-4217 code), to (ISO-4217 code)
-sql       – args: query (string)
+  weather   – Get current weather.
+              Args: location (city/place as a string), unit ("C" for Celsius or "F" for Fahrenheit)
+  calendar  – Manage calendar events.
+              Args: action ("list" to show events, "create" to add one), date (YYYY-MM-DD), title (string — required only when action is "create")
+  convert   – Convert between units (length, weight, temperature, volume, speed, area, etc.).
+              Args: value (number), from_unit (string), to_unit (string)
+  currency  – Convert between currencies using live rates.
+              Args: amount (number), from (ISO-4217 3-letter code e.g. "USD"), to (ISO-4217 3-letter code e.g. "EUR")
+  sql       – Execute a SQL query against the local database.
+              Args: query (valid SQL string)
 
-Rules (follow exactly):
-1. If the user's request clearly maps to one of the five tools, respond with ONLY a <tool_call> block:
-   <tool_call>
-   {"tool": "<name>", "args": {<args>}}
-   </tool_call>
-2. If the conversation has prior turns, resolve references ("that", "it", "there") against history.
-3. If no tool fits — chitchat, ambiguous reference with no history, impossible request, or a tool that doesn't exist — respond in plain natural language WITHOUT any <tool_call> block.
-4. Never invent tool names. Never emit partial JSON. Never add commentary outside the <tool_call> block when a tool call is appropriate.\
+Output format when calling a tool — use EXACTLY this, no other text:
+<tool_call>
+{"tool": "<tool_name>", "args": {<args_as_json>}}
+</tool_call>
+
+Rules — follow with zero deviation:
+1. TOOL CALL: When the user's request clearly maps to one of the five tools, output ONLY the <tool_call> block. No preamble, no explanation, no text before or after.
+2. DEFAULT UNIT: For weather requests that do not specify a unit, always default to "C" (Celsius).
+3. MULTI-TURN RESOLUTION: When the user uses references like "that", "it", "there", "same amount", "convert that", resolve the referent from conversation history and use the resolved values in args.
+4. REFUSAL — respond in plain natural text (NO <tool_call> block) when:
+   - The request is chitchat, a general knowledge question, or small talk
+   - The request requires a tool that does not exist (email, timer, music, maps, camera, etc.)
+   - The reference ("that", "it") cannot be resolved because there is no prior context
+   - The request is fundamentally impossible or nonsensical
+5. NEVER invent tool names outside the five listed. NEVER output partial or malformed JSON. NEVER wrap a refusal in a <tool_call> block.\
 """
 
-# ---------------------------------------------------------------------------
-# Prompt templates for each data slice
-# ---------------------------------------------------------------------------
+# ── Data pools ────────────────────────────────────────────────────────────────
 
-SLICE_PROMPTS = {
-    "weather_single": [
-        "What's the weather like in {city}?",
-        "Tell me the temperature in {city} in {unit}.",
-        "Is it hot in {city} right now? Give Celsius.",
-        "Weather forecast for {city}?",
-        "How's the weather in {city}, Fahrenheit please.",
-        "Current conditions in {city}?",
-        "What's the temp in {city} in °{unit}?",
-        "Check weather for {city}.",
-        "Give me weather for {city} in {unit}.",
-        "اخبرني عن الطقس في {city}",  # Arabic
-        "{city} mein aaj mausam kaisa hai?",  # Urdu/Hindi
-        "¿Cómo está el tiempo en {city}?",  # Spanish
-    ],
-    "calendar_list": [
-        "What's on my calendar for {date}?",
-        "Show me my schedule on {date}.",
-        "List events for {date}.",
-        "Do I have anything planned for {date}?",
-        "What meetings do I have on {date}?",
-        "Check my agenda for {date}.",
-    ],
-    "calendar_create": [
-        "Schedule '{title}' for {date}.",
-        "Add '{title}' to my calendar on {date}.",
-        "Create a meeting called '{title}' on {date}.",
-        "Book '{title}' for {date}.",
-        "Put '{title}' in my calendar on {date}.",
-        "Set up '{title}' event for {date}.",
-    ],
-    "convert_single": [
-        "Convert {value} {from_unit} to {to_unit}.",
-        "How many {to_unit} is {value} {from_unit}?",
-        "What is {value} {from_unit} in {to_unit}?",
-        "{value} {from_unit} to {to_unit} please.",
-        "I need {value} {from_unit} converted to {to_unit}.",
-        "Turn {value} {from_unit} into {to_unit}.",
-    ],
-    "currency_single": [
-        "Convert {amount} {from_curr} to {to_curr}.",
-        "How much is {amount} {from_curr} in {to_curr}?",
-        "Exchange {amount} {from_curr} to {to_curr}.",
-        "What's {amount} {from_curr} in {to_curr}?",
-        "{amount} {from_curr} equals how many {to_curr}?",
-        "I have {amount} {from_curr}, convert to {to_curr}.",
-    ],
-    "sql_single": [
-        "Run this query: {query}",
-        "Execute: {query}",
-        "Query the database: {query}",
-        "Run SQL: {query}",
-        "{query}",
-    ],
-    "refusal_chitchat": [
-        "What's your name?",
-        "Tell me a joke.",
-        "How are you?",
-        "What can you do?",
-        "Thanks for your help!",
-        "You're great!",
-        "What's 2 + 2?",
-        "Who won the World Cup in 2022?",
-        "Explain quantum computing.",
-        "Write me a poem.",
-        "What's the meaning of life?",
-        "Recommend a good book.",
-    ],
-    "refusal_unknown_tool": [
-        "Send an email to my boss.",
-        "Play some music.",
-        "Take a photo.",
-        "Turn on the lights.",
-        "Order me a pizza.",
-        "Call my mom.",
-        "Search the web for cats.",
-        "Post this to Twitter: Hello world",
-        "Set a timer for 10 minutes.",
-        "Open Spotify.",
-    ],
-    "refusal_ambiguous": [
-        "Convert that.",
-        "What about the other one?",
-        "And tomorrow?",
-        "Change it.",
-        "Show me more.",
-        "What's there?",
-    ],
-}
-
-# Sample data pools
 CITIES = [
     "London", "Tokyo", "New York", "Paris", "Dubai", "Sydney", "Berlin",
     "Mumbai", "Toronto", "Singapore", "Karachi", "Cairo", "Lagos", "Seoul",
     "Mexico City", "São Paulo", "Istanbul", "Moscow", "Bangkok", "Jakarta",
+    "Lahore", "Dhaka", "Tehran", "Baghdad", "Riyadh", "Nairobi", "Casablanca",
+    "Buenos Aires", "Lima", "Bogotá", "Amsterdam", "Rome", "Madrid", "Vienna",
 ]
+
 DATES = [
     "2025-01-15", "2025-02-20", "2025-03-10", "2025-04-05", "2025-05-30",
     "2025-06-15", "2025-07-04", "2025-08-12", "2025-09-25", "2025-10-31",
     "2025-11-11", "2025-12-25", "2026-01-01", "2026-02-14", "2026-03-08",
+    "2026-04-18", "2026-05-01", "2026-06-20", "2026-07-10", "2026-08-22",
 ]
+
 TITLES = [
     "Team standup", "Doctor appointment", "Lunch with Alex", "Board meeting",
     "Project review", "Dentist visit", "Birthday party", "Sales call",
     "Training session", "Quarterly review", "Client meeting", "Job interview",
+    "Flight to Dubai", "Gym session", "Product launch", "1:1 with manager",
+    "School pickup", "Vet appointment", "Conference call", "Sprint planning",
 ]
+
 CONVERT_PAIRS = [
-    (5, "km", "miles"), (100, "lbs", "kg"), (72, "F", "C"), (30, "C", "F"),
-    (1.5, "liters", "gallons"), (200, "cm", "inches"), (10, "oz", "grams"),
-    (50, "mph", "kph"), (1000, "meters", "feet"), (2.5, "acres", "hectares"),
-    (500, "ml", "cups"), (3, "yards", "meters"), (15, "stone", "kg"),
-    (100, "calories", "kilojoules"), (60, "minutes", "hours"),
+    # (value, from_unit, to_unit)
+    (5, "km", "miles"),
+    (100, "lbs", "kg"),
+    (72, "F", "C"),
+    (30, "C", "F"),
+    (1.5, "liters", "gallons"),
+    (200, "cm", "inches"),
+    (10, "oz", "grams"),
+    (50, "mph", "kph"),
+    (1000, "meters", "feet"),
+    (2.5, "acres", "hectares"),
+    (500, "ml", "cups"),
+    (3, "yards", "meters"),
+    (15, "stone", "kg"),
+    (100, "calories", "kilojoules"),
+    (60, "minutes", "hours"),
+    (8, "feet", "meters"),
+    (250, "grams", "oz"),
+    (10, "miles", "km"),
+    (37, "C", "F"),
+    (98.6, "F", "C"),
+    (5, "kg", "lbs"),
+    (1, "mile", "km"),
+    (100, "kph", "mph"),
+    (1000, "grams", "kg"),
 ]
+
 CURRENCY_PAIRS = [
-    (100, "USD", "EUR"), (50, "EUR", "GBP"), (1000, "JPY", "USD"),
-    (500, "GBP", "INR"), (200, "AUD", "CAD"), (75, "CHF", "USD"),
-    (1500, "INR", "USD"), (300, "CAD", "EUR"), (10000, "PKR", "USD"),
-    (250, "SAR", "EUR"), (1000, "AED", "USD"), (800, "SGD", "USD"),
+    # (amount, from_ISO, to_ISO)
+    (100, "USD", "EUR"),
+    (50, "EUR", "GBP"),
+    (1000, "JPY", "USD"),
+    (500, "GBP", "INR"),
+    (200, "AUD", "CAD"),
+    (75, "CHF", "USD"),
+    (1500, "INR", "USD"),
+    (300, "CAD", "EUR"),
+    (10000, "PKR", "USD"),
+    (250, "SAR", "EUR"),
+    (1000, "AED", "USD"),
+    (800, "SGD", "USD"),
+    (5000, "MXN", "USD"),
+    (200, "USD", "JPY"),
+    (1000, "USD", "PKR"),
+    (500, "EUR", "GBP"),
+    (100, "GBP", "USD"),
+    (2000, "INR", "PKR"),
+    (150, "USD", "AED"),
+    (300, "USD", "SAR"),
 ]
+
 SQL_QUERIES = [
     "SELECT * FROM users WHERE active = 1",
     "SELECT COUNT(*) FROM orders WHERE date > '2025-01-01'",
@@ -177,221 +147,603 @@ SQL_QUERIES = [
     "SELECT * FROM logs WHERE level = 'ERROR' ORDER BY timestamp DESC LIMIT 50",
     "SELECT product_id, COUNT(*) as views FROM page_views GROUP BY product_id",
     "SELECT u.name, COUNT(o.id) as orders FROM users u JOIN orders o ON u.id = o.user_id GROUP BY u.id",
+    "DELETE FROM sessions WHERE expires_at < NOW()",
+    "SELECT * FROM inventory WHERE quantity < 10",
+    "SELECT DISTINCT city FROM addresses",
+    "INSERT INTO events (title, date) VALUES ('Meeting', '2025-06-15')",
+    "SELECT * FROM employees WHERE hire_date > '2024-01-01' ORDER BY hire_date",
 ]
 
-ADVERSARIAL_PROMPTS = [
-    # Typos
-    "wether in {city} celsius plz",
-    "convrt {value} {from_unit} to {to_unit}",
-    "curency {amount} {from_curr} to {to_curr}",
-    "calander for {date}",
-    "schedul '{title}' on {date}",
-    # Code-switched (Hindi/Urdu + English)
-    "{city} ka weather Celsius mein batao",
-    "Mujhe {amount} {from_curr} ko {to_curr} mein convert karo",
-    "{value} {from_unit} ko {to_unit} mein badlo",
-    # Code-switched (Spanish + English)
-    "¿Cuál es el tiempo en {city} en Fahrenheit?",
-    "Convierte {value} {from_unit} a {to_unit} por favor",
-    # Unit ambiguity
-    "Convert {value} C to F",  # C could be cups or Celsius
-    "Convert {value} oz to ml",  # fluid vs weight oz
-    "Weather in {city}",  # no unit specified - model should pick default or ask
-    # Hallucination-bait (non-existent places/currencies)
-    "Weather in Narnia",
-    "Convert 100 USD to Wakandan Vibranium",
-    "Weather in {city} in Kelvin",  # K not in schema
-]
-
-MULTITURN_TEMPLATES = [
-    {
-        "turns": [
-            {"role": "user", "content": "What's {amount} {from_curr} in {to_curr}?"},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"currency\", \"args\": {{\"amount\": {amount}, \"from\": \"{from_curr}\", \"to\": \"{to_curr}\"}}}}\n</tool_call>"},
-            {"role": "user", "content": "Now convert that to {third_curr}."},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"currency\", \"args\": {{\"amount\": {amount}, \"from\": \"{from_curr}\", \"to\": \"{third_curr}\"}}}}\n</tool_call>"},
-        ]
-    },
-    {
-        "turns": [
-            {"role": "user", "content": "Weather in {city}?"},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"weather\", \"args\": {{\"location\": \"{city}\", \"unit\": \"C\"}}}}\n</tool_call>"},
-            {"role": "user", "content": "And what about tomorrow's calendar?"},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"calendar\", \"args\": {{\"action\": \"list\", \"date\": \"{date}\"}}}}\n</tool_call>"},
-        ]
-    },
-    {
-        "turns": [
-            {"role": "user", "content": "Convert {value} {from_unit} to {to_unit}."},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"convert\", \"args\": {{\"value\": {value}, \"from_unit\": \"{from_unit}\", \"to_unit\": \"{to_unit}\"}}}}\n</tool_call>"},
-            {"role": "user", "content": "Now convert it to {to_unit2} instead."},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"convert\", \"args\": {{\"value\": {value}, \"from_unit\": \"{from_unit}\", \"to_unit\": \"{to_unit2}\"}}}}\n</tool_call>"},
-        ]
-    },
-    {
-        "turns": [
-            {"role": "user", "content": "Schedule '{title}' for {date}."},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"calendar\", \"args\": {{\"action\": \"create\", \"date\": \"{date}\", \"title\": \"{title}\"}}}}\n</tool_call>"},
-            {"role": "user", "content": "Actually what do I have that day?"},
-            {"role": "assistant", "content": "<tool_call>\n{{\"tool\": \"calendar\", \"args\": {{\"action\": \"list\", \"date\": \"{date}\"}}}}\n</tool_call>"},
-        ]
-    },
-]
+CURRENCY_NAMES = {
+    "USD": ["dollars", "US dollars", "American dollars", "USD"],
+    "EUR": ["euros", "Euro", "EUR"],
+    "GBP": ["pounds", "British pounds", "sterling", "GBP"],
+    "INR": ["rupees", "Indian rupees", "INR"],
+    "PKR": ["rupees", "Pakistani rupees", "PKR"],
+    "JPY": ["yen", "Japanese yen", "JPY"],
+    "AED": ["dirhams", "UAE dirhams", "AED"],
+    "SAR": ["riyals", "Saudi riyals", "SAR"],
+    "CAD": ["Canadian dollars", "CAD"],
+    "AUD": ["Australian dollars", "AUD"],
+    "CHF": ["Swiss francs", "francs", "CHF"],
+    "SGD": ["Singapore dollars", "SGD"],
+    "MXN": ["pesos", "Mexican pesos", "MXN"],
+}
 
 
-def fill_template(template: str) -> str:
-    city = random.choice(CITIES)
-    date = random.choice(DATES)
-    title = random.choice(TITLES)
-    cv, fu, tu = random.choice(CONVERT_PAIRS)
-    am, fc, tc = random.choice(CURRENCY_PAIRS)
-    query = random.choice(SQL_QUERIES)
-    unit = random.choice(["C", "F"])
-
-    return template.format(
-        city=city, date=date, title=title,
-        value=cv, from_unit=fu, to_unit=tu,
-        amount=am, from_curr=fc, to_curr=tc,
-        query=query, unit=unit,
-    )
+def currency_name(iso: str) -> str:
+    names = CURRENCY_NAMES.get(iso, [iso])
+    return random.choice(names)
 
 
-def make_single_turn_example(user_msg: str, expected_tool: str | None, expected_args: dict | None) -> dict:
-    if expected_tool:
-        assistant_content = f"<tool_call>\n{json.dumps({'tool': expected_tool, 'args': expected_args})}\n</tool_call>"
-    else:
-        # For refusals we ask GPT to generate a natural response — handled separately
-        assistant_content = None
+# ── Per-tool template generators ──────────────────────────────────────────────
+# Each function produces (user_msg, ground_truth_args) pairs with guaranteed consistency.
+# NO fill_template() calls — every variable is set once and used consistently.
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.append({"role": "user", "content": user_msg})
-    if assistant_content:
-        messages.append({"role": "assistant", "content": assistant_content})
-    return {"messages": messages}
+def gen_weather(n: int = 220) -> list[dict]:
+    """Generate weather examples with correct city/unit pairing."""
+    examples = []
+    for _ in range(n):
+        city = random.choice(CITIES)
+        r = random.random()
+
+        if r < 0.22:
+            # Explicit Celsius in prompt → unit = "C"
+            unit = "C"
+            user_msg = random.choice([
+                f"What's the weather in {city} in Celsius?",
+                f"How hot is it in {city}? Celsius please.",
+                f"Temperature in {city} in degrees Celsius?",
+                f"{city} weather, Celsius.",
+                f"Give me the temperature in {city} in °C.",
+                f"Current temp in {city} — Celsius.",
+                f"Weather for {city} in C?",
+            ])
+        elif r < 0.42:
+            # Explicit Fahrenheit in prompt → unit = "F"
+            unit = "F"
+            user_msg = random.choice([
+                f"What's the weather in {city} in Fahrenheit?",
+                f"How hot is it in {city}? Fahrenheit please.",
+                f"Temperature in {city} in °F?",
+                f"{city} weather, Fahrenheit.",
+                f"What's the temp in {city} in Fahrenheit?",
+                f"Weather for {city} in F?",
+            ])
+        elif r < 0.68:
+            # No unit specified → always default to "C"
+            unit = "C"
+            user_msg = random.choice([
+                f"What's the weather like in {city}?",
+                f"Weather in {city}?",
+                f"Weather forecast for {city}?",
+                f"How's the weather in {city}?",
+                f"Current conditions in {city}?",
+                f"What's the temperature in {city}?",
+                f"Is it hot in {city} right now?",
+                f"Check the weather in {city}.",
+                f"What should I wear in {city} today?",
+                f"Tell me the weather in {city}.",
+                # Multilingual — no unit → default "C"
+                f"اخبرني عن الطقس في {city}",
+                f"{city} mein aaj mausam kaisa hai?",
+                f"¿Cómo está el tiempo en {city}?",
+                f"{city} ka mausam batao",
+                f"Bataiye {city} mein kaisa mausam hai",
+                f"هوای {city} چطوره؟",
+            ])
+        else:
+            # Unit as variable — choose unit first, then build prompt around it
+            unit = random.choice(["C", "F"])
+            unit_word = "Celsius" if unit == "C" else "Fahrenheit"
+            user_msg = random.choice([
+                f"What's the temp in {city} in {unit_word}?",
+                f"Tell me the temperature in {city} in {unit}.",
+                f"Give me weather for {city} in {unit}.",
+                f"{city} weather in {unit_word} please.",
+                f"Weather in {city} ({unit})?",
+                f"I need the weather in {city} — {unit_word}.",
+            ])
+
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "weather", "args": {{"location": "{city}", "unit": "{unit}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
 
 
-def generate_rule_based_examples() -> list[dict]:
-    """Fast, free, deterministic examples from templates."""
+def gen_calendar_list(n: int = 110) -> list[dict]:
+    examples = []
+    for _ in range(n):
+        date = random.choice(DATES)
+        user_msg = random.choice([
+            f"What's on my calendar for {date}?",
+            f"Show me my schedule on {date}.",
+            f"List events for {date}.",
+            f"Do I have anything planned for {date}?",
+            f"What meetings do I have on {date}?",
+            f"Check my agenda for {date}.",
+            f"Any appointments on {date}?",
+            f"What's happening on {date}?",
+            f"Show events on {date}.",
+            f"Calendar for {date}?",
+            f"{date} mein kya schedule hai?",
+            f"¿Qué tengo en el calendario el {date}?",
+            f"Kya hai mere calendar mein {date} ko?",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "list", "date": "{date}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
+
+
+def gen_calendar_create(n: int = 110) -> list[dict]:
+    examples = []
+    for _ in range(n):
+        date = random.choice(DATES)
+        title = random.choice(TITLES)
+        user_msg = random.choice([
+            f"Schedule '{title}' for {date}.",
+            f"Add '{title}' to my calendar on {date}.",
+            f"Create a calendar event called '{title}' on {date}.",
+            f"Book '{title}' for {date}.",
+            f"Put '{title}' in my calendar on {date}.",
+            f"Set up a '{title}' event for {date}.",
+            f"Can you add {title} to my calendar on {date}?",
+            f"New event: {title}, on {date}.",
+            f"I have {title} on {date}, add it to my calendar.",
+            f"Create: {title} — {date}.",
+            f"{date} ko '{title}' calendar mein add karo.",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "create", "date": "{date}", "title": "{title}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
+
+
+def gen_convert(n: int = 220) -> list[dict]:
+    examples = []
+    for _ in range(n):
+        value, from_unit, to_unit = random.choice(CONVERT_PAIRS)
+        user_msg = random.choice([
+            f"Convert {value} {from_unit} to {to_unit}.",
+            f"How many {to_unit} is {value} {from_unit}?",
+            f"What is {value} {from_unit} in {to_unit}?",
+            f"{value} {from_unit} to {to_unit} please.",
+            f"I need {value} {from_unit} converted to {to_unit}.",
+            f"Turn {value} {from_unit} into {to_unit}.",
+            f"Convert: {value} {from_unit} → {to_unit}",
+            f"What's {value} {from_unit} in {to_unit}?",
+            f"How much is {value} {from_unit} in {to_unit}?",
+            f"{value} {from_unit} equals how many {to_unit}?",
+            f"I have {value} {from_unit}. What is that in {to_unit}?",
+            # Code-switched
+            f"{value} {from_unit} ko {to_unit} mein convert karo.",
+            f"Convierte {value} {from_unit} a {to_unit}.",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "convert", "args": {{"value": {value}, "from_unit": "{from_unit}", "to_unit": "{to_unit}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
+
+
+def gen_currency(n: int = 220) -> list[dict]:
+    examples = []
+    for _ in range(n):
+        amount, from_iso, to_iso = random.choice(CURRENCY_PAIRS)
+        from_name = currency_name(from_iso)
+        to_name = currency_name(to_iso)
+        user_msg = random.choice([
+            f"Convert {amount} {from_iso} to {to_iso}.",
+            f"How much is {amount} {from_iso} in {to_iso}?",
+            f"Exchange {amount} {from_iso} to {to_iso}.",
+            f"What's {amount} {from_iso} in {to_iso}?",
+            f"{amount} {from_iso} equals how many {to_iso}?",
+            f"I have {amount} {from_iso}, convert to {to_iso}.",
+            f"What is {amount} {from_name} in {to_name}?",
+            f"Convert {amount} {from_name} to {to_name}.",
+            f"How many {to_name} is {amount} {from_name}?",
+            f"{amount} {from_name} to {to_iso}.",
+            # Code-switched
+            f"Mujhe {amount} {from_iso} ko {to_iso} mein convert karo.",
+            f"{amount} {from_iso} ko {to_iso} mein badlo.",
+            f"¿Cuánto son {amount} {from_iso} en {to_iso}?",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{from_iso}", "to": "{to_iso}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
+
+
+def gen_sql(n: int = 110) -> list[dict]:
+    examples = []
+    for _ in range(n):
+        query = random.choice(SQL_QUERIES)
+        user_msg = random.choice([
+            f"Run this query: {query}",
+            f"Execute: {query}",
+            f"Query the database: {query}",
+            f"Run SQL: {query}",
+            f"Run this: {query}",
+            f"Execute this SQL: {query}",
+            f"Database query: {query}",
+            f"{query}",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "sql", "args": {{"query": "{query}"}}}}\n</tool_call>'},
+            ]
+        })
+    return examples
+
+
+# ── Multi-turn examples ───────────────────────────────────────────────────────
+
+def gen_multiturn(n: int = 180) -> list[dict]:
+    """
+    Multi-turn conversations where the model must resolve references.
+    All variable bindings are consistent within each example.
+    """
     examples = []
 
-    # Weather
-    for _ in range(220):
-        city = random.choice(CITIES)
-        unit = random.choice(["C", "F"])
-        template = random.choice(SLICE_PROMPTS["weather_single"])
+    templates = [
+        # Currency → convert that to a third currency
+        lambda: _mt_currency_chain(),
+        # Weather → then calendar
+        lambda: _mt_weather_then_calendar(),
+        # Convert → change the target unit
+        lambda: _mt_convert_change_unit(),
+        # Calendar create → then list that day
+        lambda: _mt_calendar_create_then_list(),
+        # Currency → ask about the same pair reversed
+        lambda: _mt_currency_then_reverse(),
+        # Weather → ask in the other unit
+        lambda: _mt_weather_unit_switch(),
+        # SQL → another query on the same table
+        lambda: _mt_sql_follow_up(),
+    ]
+
+    for _ in range(n):
+        fn = random.choice(templates)
         try:
-            user_msg = fill_template(template).replace("{city}", city).replace("{unit}", unit)
+            ex = fn()
+            if ex:
+                examples.append(ex)
         except Exception:
-            user_msg = f"What's the weather in {city} in {unit}?"
-        ex = make_single_turn_example(user_msg, "weather", {"location": city, "unit": unit})
-        examples.append(ex)
-
-    # Calendar list
-    for _ in range(100):
-        date = random.choice(DATES)
-        template = random.choice(SLICE_PROMPTS["calendar_list"])
-        user_msg = template.format(date=date)
-        ex = make_single_turn_example(user_msg, "calendar", {"action": "list", "date": date})
-        examples.append(ex)
-
-    # Calendar create
-    for _ in range(100):
-        date = random.choice(DATES)
-        title = random.choice(TITLES)
-        template = random.choice(SLICE_PROMPTS["calendar_create"])
-        user_msg = template.format(title=title, date=date)
-        ex = make_single_turn_example(user_msg, "calendar", {"action": "create", "date": date, "title": title})
-        examples.append(ex)
-
-    # Convert
-    for _ in range(220):
-        cv, fu, tu = random.choice(CONVERT_PAIRS)
-        template = random.choice(SLICE_PROMPTS["convert_single"])
-        user_msg = template.format(value=cv, from_unit=fu, to_unit=tu)
-        ex = make_single_turn_example(user_msg, "convert", {"value": cv, "from_unit": fu, "to_unit": tu})
-        examples.append(ex)
-
-    # Currency
-    for _ in range(220):
-        am, fc, tc = random.choice(CURRENCY_PAIRS)
-        template = random.choice(SLICE_PROMPTS["currency_single"])
-        user_msg = template.format(amount=am, from_curr=fc, to_curr=tc)
-        ex = make_single_turn_example(user_msg, "currency", {"amount": am, "from": fc, "to": tc})
-        examples.append(ex)
-
-    # SQL
-    for _ in range(100):
-        query = random.choice(SQL_QUERIES)
-        template = random.choice(SLICE_PROMPTS["sql_single"])
-        user_msg = template.format(query=query)
-        ex = make_single_turn_example(user_msg, "sql", {"query": query})
-        examples.append(ex)
-
-    # Multi-turn (rule-based)
-    for _ in range(150):
-        tmpl = random.choice(MULTITURN_TEMPLATES)
-        city = random.choice(CITIES)
-        date = random.choice(DATES)
-        title = random.choice(TITLES)
-        cv, fu, tu = random.choice(CONVERT_PAIRS)
-        _, tu2, _ = random.choice(CONVERT_PAIRS)
-        am, fc, tc = random.choice(CURRENCY_PAIRS)
-        _, _, third_curr = random.choice(CURRENCY_PAIRS)
-
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for turn in tmpl["turns"]:
-            content = turn["content"].format(
-                city=city, date=date, title=title,
-                value=cv, from_unit=fu, to_unit=tu, to_unit2=tu2,
-                amount=am, from_curr=fc, to_curr=tc, third_curr=third_curr,
-            )
-            messages.append({"role": turn["role"], "content": content})
-        examples.append({"messages": messages})
+            pass
 
     return examples
 
 
-def generate_refusal_examples_via_api(client: OpenAI, count: int = 150) -> list[dict]:
-    """Ask GPT-4o-mini to produce natural refusal responses."""
+def _mt_currency_chain():
+    amount, from_iso, to_iso = random.choice(CURRENCY_PAIRS)
+    _, _, third_iso = random.choice([p for p in CURRENCY_PAIRS if p[2] != to_iso])
+    ref = random.choice(["that", "the same amount", "it", "those"])
+    turns = [
+        {"role": "user", "content": f"What's {amount} {from_iso} in {to_iso}?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{from_iso}", "to": "{to_iso}"}}}}\n</tool_call>'},
+        {"role": "user", "content": f"Now convert {ref} to {third_iso}."},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{from_iso}", "to": "{third_iso}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_weather_then_calendar():
+    city = random.choice(CITIES)
+    date = random.choice(DATES)
+    turns = [
+        {"role": "user", "content": f"Weather in {city}?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "weather", "args": {{"location": "{city}", "unit": "C"}}}}\n</tool_call>'},
+        {"role": "user", "content": f"And what do I have on my calendar for {date}?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "list", "date": "{date}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_convert_change_unit():
+    value, from_unit, to_unit = random.choice(CONVERT_PAIRS)
+    _, _, to_unit2 = random.choice([p for p in CONVERT_PAIRS if p[0] == value and p[1] == from_unit and p[2] != to_unit] or [random.choice(CONVERT_PAIRS)])
+    # Ensure to_unit2 is different from to_unit
+    other_pairs = [p for p in CONVERT_PAIRS if p[1] == from_unit and p[2] != to_unit]
+    if not other_pairs:
+        return None
+    _, _, to_unit2 = random.choice(other_pairs)
+    ref = random.choice(["it", "the same value", "that"])
+    turns = [
+        {"role": "user", "content": f"Convert {value} {from_unit} to {to_unit}."},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "convert", "args": {{"value": {value}, "from_unit": "{from_unit}", "to_unit": "{to_unit}"}}}}\n</tool_call>'},
+        {"role": "user", "content": f"Now convert {ref} to {to_unit2} instead."},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "convert", "args": {{"value": {value}, "from_unit": "{from_unit}", "to_unit": "{to_unit2}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_calendar_create_then_list():
+    date = random.choice(DATES)
+    title = random.choice(TITLES)
+    turns = [
+        {"role": "user", "content": f"Add '{title}' to my calendar on {date}."},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "create", "date": "{date}", "title": "{title}"}}}}\n</tool_call>'},
+        {"role": "user", "content": random.choice([
+            "Actually, what else do I have that day?",
+            "What's on my schedule for that day?",
+            "Show me everything for that date.",
+            "What's my full agenda for that day?",
+        ])},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "list", "date": "{date}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_currency_then_reverse():
+    amount, from_iso, to_iso = random.choice(CURRENCY_PAIRS)
+    reverse_amount = round(amount * 0.85, 2)  # approximate, doesn't matter
+    turns = [
+        {"role": "user", "content": f"How much is {amount} {from_iso} in {to_iso}?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{from_iso}", "to": "{to_iso}"}}}}\n</tool_call>'},
+        {"role": "user", "content": f"What about the other way — {amount} {to_iso} to {from_iso}?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{to_iso}", "to": "{from_iso}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_weather_unit_switch():
+    city = random.choice(CITIES)
+    turns = [
+        {"role": "user", "content": f"What's the weather in {city} in Celsius?"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "weather", "args": {{"location": "{city}", "unit": "C"}}}}\n</tool_call>'},
+        {"role": "user", "content": random.choice([
+            "And in Fahrenheit?",
+            "What's that in Fahrenheit?",
+            "Now give it in F.",
+            "Same but Fahrenheit please.",
+        ])},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "weather", "args": {{"location": "{city}", "unit": "F"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+def _mt_sql_follow_up():
+    query1 = random.choice(SQL_QUERIES)
+    query2 = random.choice([q for q in SQL_QUERIES if q != query1])
+    turns = [
+        {"role": "user", "content": f"Run: {query1}"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "sql", "args": {{"query": "{query1}"}}}}\n</tool_call>'},
+        {"role": "user", "content": f"Now run: {query2}"},
+        {"role": "assistant", "content": f'<tool_call>\n{{"tool": "sql", "args": {{"query": "{query2}"}}}}\n</tool_call>'},
+    ]
+    return {"messages": [{"role": "system", "content": SYSTEM_PROMPT}] + turns}
+
+
+# ── Adversarial templates (rule-based) ────────────────────────────────────────
+
+def gen_adversarial_rulebased() -> list[dict]:
+    """
+    Typos, code-switched, and unit-ambiguous examples with correct ground truth.
+    For hallucination-bait, the model must refuse.
+    """
     examples = []
-    prompts_pool = (
-        SLICE_PROMPTS["refusal_chitchat"]
-        + SLICE_PROMPTS["refusal_unknown_tool"]
-        + SLICE_PROMPTS["refusal_ambiguous"]
-    )
+
+    # --- Typo + code-switched: still map to real tools ---
+    for _ in range(60):
+        city = random.choice(CITIES)
+        unit = random.choice(["C", "F"])
+        user_msg = random.choice([
+            f"wether in {city} celsius plz",
+            f"wheather {city}",
+            f"Celsius temprature for {city}?",
+            f"{city} ka temprature batao celsius mein",
+            f"mujhe {city} ka mausam chahiye",
+            f"¿Cómo está el tiempo en {city}? en grados Celsius",
+            f"{city} mein aaj kitni garmi hai?",
+            f"bata {city} weather",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "weather", "args": {{"location": "{city}", "unit": "C"}}}}\n</tool_call>'},
+            ]
+        })
+
+    for _ in range(40):
+        value, from_unit, to_unit = random.choice(CONVERT_PAIRS)
+        user_msg = random.choice([
+            f"convrt {value} {from_unit} to {to_unit}",
+            f"convertt {value} {from_unit} in {to_unit}",
+            f"{value} {from_unit} se {to_unit} mein badlo",
+            f"Convierte {value} {from_unit} a {to_unit}",
+            f"konvert {value} {from_unit} to {to_unit}",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "convert", "args": {{"value": {value}, "from_unit": "{from_unit}", "to_unit": "{to_unit}"}}}}\n</tool_call>'},
+            ]
+        })
+
+    for _ in range(40):
+        amount, from_iso, to_iso = random.choice(CURRENCY_PAIRS)
+        from_name = currency_name(from_iso)
+        to_name = currency_name(to_iso)
+        user_msg = random.choice([
+            f"curency {amount} {from_iso} to {to_iso}",
+            f"{amount} {from_name} ko {to_name} mein convert karo",
+            f"¿Cuánto son {amount} {from_name} en {to_name}?",
+            f"Mujhe {amount} {from_iso} se {to_iso} mein chahiye",
+            f"currancy {amount} {from_iso} to {to_iso}",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "currency", "args": {{"amount": {amount}, "from": "{from_iso}", "to": "{to_iso}"}}}}\n</tool_call>'},
+            ]
+        })
+
+    for _ in range(20):
+        date = random.choice(DATES)
+        user_msg = random.choice([
+            f"calander for {date}",
+            f"calender {date}",
+            f"{date} ka schedule dikhao",
+            f"¿Qué tengo el {date}?",
+        ])
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": f'<tool_call>\n{{"tool": "calendar", "args": {{"action": "list", "date": "{date}"}}}}\n</tool_call>'},
+            ]
+        })
+
+    # --- Hallucination-bait: must REFUSE ---
+    hallucination_refusals = [
+        ("Weather in Narnia", "I'm sorry, Narnia isn't a real location — I can't retrieve weather data for it."),
+        ("Weather in Middle Earth in Celsius", "Middle Earth is fictional, so I can't retrieve weather data for it."),
+        ("Convert 100 USD to Wakandan Vibranium", "Wakandan Vibranium isn't a real currency, so I can't perform that conversion."),
+        ("Weather in {city} in Kelvin".format(city=random.choice(CITIES)), "I can only provide weather in Celsius (C) or Fahrenheit (F), not Kelvin."),
+        ("Exchange rate for Dogecoin to USD", "I don't have a currency tool that handles cryptocurrency — I only support standard ISO-4217 currencies."),
+        ("Convert 10 furlongs per fortnight to speed of light", "That's a very unusual unit combination! I can convert standard units but 'speed of light' isn't a supported target unit."),
+    ]
+    for user_msg, refusal_text in hallucination_refusals:
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": refusal_text},
+            ]
+        })
+
+    return examples
+
+
+# ── Refusals (rule-based) ─────────────────────────────────────────────────────
+
+REFUSAL_PAIRS = [
+    # (user_msg, assistant_response)
+    ("What's your name?", "I'm Pocket-Agent, your offline mobile assistant. I can help with weather, calendar, unit conversion, currency exchange, and SQL queries."),
+    ("Tell me a joke.", "I'm not built for entertainment — but I can check your calendar, convert units, or look up the weather!"),
+    ("How are you?", "I'm running great, thanks for asking! How can I help you today?"),
+    ("What can you do?", "I can help with: weather lookups, calendar management, unit conversions, currency exchange, and running SQL queries."),
+    ("Thanks for your help!", "Happy to help! Let me know if you need anything else."),
+    ("What's 2 + 2?", "That's 4! For math, I'd suggest a calculator — I'm best suited for weather, calendar, conversions, currency, and SQL."),
+    ("Who won the World Cup in 2022?", "Argentina won the 2022 FIFA World Cup. For live information like this, you'd need a web search — I'm an offline assistant."),
+    ("Explain quantum computing.", "Quantum computing uses quantum bits (qubits) that can exist in superposition, enabling certain calculations much faster than classical computers. That said, I'm better suited for tool-based tasks like weather or conversions!"),
+    ("Write me a poem.", "I'm a task-focused assistant — poetry is a bit out of my scope! I can help you check the weather, manage your calendar, or convert units."),
+    ("Send an email to my boss.", "I don't have an email tool — my capabilities are limited to weather, calendar, unit conversion, currency exchange, and SQL queries."),
+    ("Play some music.", "I can't play music — I don't have a media tool. I can help with weather, calendar, conversions, currency, or SQL though!"),
+    ("Turn on the lights.", "I don't have smart home controls. My tools are: weather, calendar, unit convert, currency, and SQL."),
+    ("Order me a pizza.", "I can't place orders — I don't have an ordering tool. Can I help you with something else?"),
+    ("Call my mom.", "I don't have a calling feature. I can assist with weather, calendar, unit conversion, currency exchange, and SQL queries."),
+    ("Set a timer for 10 minutes.", "I don't have a timer tool. My capabilities are: weather, calendar, unit conversion, currency exchange, and SQL."),
+    ("Open Spotify.", "I can't open apps. I'm limited to weather, calendar, conversions, currency, and SQL queries."),
+    ("Search the web for the latest news.", "I'm fully offline — I can't browse the web. Let me know if I can help with weather, calendar, conversions, or SQL!"),
+    ("What's the stock price of Apple?", "I don't have a stock price tool. I can help with weather, currency conversion, calendar, unit conversion, or SQL."),
+    ("Translate 'hello' to French.", "I don't have a translation tool. My tools are limited to weather, calendar, unit conversion, currency, and SQL."),
+    ("Remind me to drink water every hour.", "I don't have a reminder or recurring alarm tool. I can manage single calendar events though — want me to add one?"),
+    # Ambiguous references with no history
+    ("Convert that.", "I'm not sure what you'd like me to convert — could you provide a value and the units?"),
+    ("What about the other one?", "I don't have context for 'the other one' — could you clarify what you're referring to?"),
+    ("And tomorrow?", "Could you clarify what you'd like for tomorrow? I can check weather or list calendar events, but I need more context."),
+    ("Change it.", "I'm not sure what you'd like me to change. Could you provide more details?"),
+    ("Show me more.", "I need more context — more of what? I can look up weather, calendar events, do conversions, or run SQL queries."),
+]
+
+
+def gen_refusals_rulebased() -> list[dict]:
+    examples = []
+    for user_msg, response in REFUSAL_PAIRS:
+        examples.append({
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": response},
+            ]
+        })
+    return examples
+
+
+# ── API-based generation (higher diversity) ───────────────────────────────────
+
+def gen_refusals_via_api(client: OpenAI, count: int = 120) -> list[dict]:
+    """GPT-4o-mini generates varied, natural refusal responses."""
+    examples = []
+    prompts_pool = [
+        "What's the weather on Mars?",
+        "Post this to Twitter: just had coffee",
+        "What time is it?",
+        "Navigate to the nearest hospital.",
+        "Book a flight to London.",
+        "Who is the current US president?",
+        "Fix my code.",
+        "What's my WiFi password?",
+        "How do I lose weight?",
+        "Can you summarize this article?",
+        "Make me a shopping list.",
+        "What movies are playing nearby?",
+        "Diagnose my symptoms: headache and fever.",
+        "What's the best programming language?",
+        "Help me write a cover letter.",
+        "Convert happiness to joy.",
+        "What's the exchange rate for smiles to laughs?",
+        "Show me news from today.",
+        "Track my package.",
+        "How tall is Mount Everest?",
+    ]
 
     batch_size = 10
-    batches_needed = (count + batch_size - 1) // batch_size
-
-    for batch_idx in range(batches_needed):
-        batch_prompts = random.choices(prompts_pool, k=batch_size)
-        prompt_list = "\n".join(f"{i+1}. {p}" for i, p in enumerate(batch_prompts))
-
+    for batch_idx in range((count + batch_size - 1) // batch_size):
+        batch = random.choices(prompts_pool, k=batch_size)
+        prompt_list = "\n".join(f"{i+1}. {p}" for i, p in enumerate(batch))
         try:
-            response = client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "You are generating training data for a mobile assistant that can ONLY use these tools: "
+                            "You are generating training examples for a mobile assistant that has ONLY these five tools: "
                             "weather, calendar, convert, currency, sql.\n\n"
-                            "For each user message below, write a short natural assistant response that does NOT "
-                            "use any tool call — because the request doesn't match any tool, is ambiguous, or is chitchat.\n\n"
-                            "Return a JSON array of strings, one response per item. Match the order of inputs.\n"
-                            "Keep responses concise (1-2 sentences)."
+                            "For each user message, write a short, helpful, natural-sounding assistant response that:\n"
+                            "- Does NOT use any <tool_call> block\n"
+                            "- Politely explains why the request can't be fulfilled with the available tools\n"
+                            "- Mentions what the assistant CAN help with if relevant\n"
+                            "- Is 1-2 sentences max\n\n"
+                            "Return a JSON object: {\"responses\": [\"response1\", \"response2\", ...]}"
                         ),
                     },
                     {"role": "user", "content": f"User messages:\n{prompt_list}"},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.8,
+                temperature=0.9,
             )
-            data = json.loads(response.choices[0].message.content)
-            responses = data.get("responses", list(data.values())[0] if data else [])
-
-            for user_msg, asst_resp in zip(batch_prompts, responses):
-                if isinstance(asst_resp, str) and asst_resp.strip():
+            data = json.loads(resp.choices[0].message.content)
+            responses = data.get("responses", [])
+            for user_msg, asst_resp in zip(batch, responses):
+                if isinstance(asst_resp, str) and asst_resp.strip() and "<tool_call>" not in asst_resp:
                     examples.append({
                         "messages": [
                             {"role": "system", "content": SYSTEM_PROMPT},
@@ -400,7 +752,7 @@ def generate_refusal_examples_via_api(client: OpenAI, count: int = 150) -> list[
                         ]
                     })
         except Exception as e:
-            print(f"  [refusal batch {batch_idx}] error: {e}")
+            print(f"  [refusal API batch {batch_idx}] error: {e}")
             time.sleep(2)
 
         if len(examples) >= count:
@@ -409,221 +761,240 @@ def generate_refusal_examples_via_api(client: OpenAI, count: int = 150) -> list[
     return examples[:count]
 
 
-def generate_adversarial_via_api(client: OpenAI, count: int = 150) -> list[dict]:
-    """GPT-4o-mini generates correct responses for typo/code-switched inputs."""
-    examples = []
+def gen_adversarial_via_api(client: OpenAI, count: int = 120) -> list[dict]:
+    """
+    GPT-4o-mini produces correct tool calls for tricky, real-world phrasings.
+    We send the exact SYSTEM_PROMPT so GPT uses the same rules as our model.
+    """
+    adversarial_inputs = [
+        # Typos
+        "wether in {city} celsius plz",
+        "convrt {value} {from_unit} to {to_unit}",
+        "curency {amount} {from_curr} to {to_curr}",
+        "calander for {date}",
+        "schedul '{title}' on {date}",
+        # Hindi/Urdu + English
+        "{city} ka weather batao Fahrenheit mein",
+        "Mujhe {amount} {from_curr} ko {to_curr} mein convert karo",
+        "{value} {from_unit} ko {to_unit} mein badlo please",
+        "{date} ko '{title}' schedule karo",
+        "mere calendar mein {date} kya hai",
+        # Arabic + English
+        "اريد weather في {city} بالسيلزيوس",
+        "كم {amount} {from_curr} في {to_curr}؟",
+        # Spanish + English
+        "¿Cuál es la temperatura en {city}? Give me Celsius",
+        "Convierte {value} {from_unit} a {to_unit} por favor",
+        "¿Cuánto son {amount} {from_curr} en {to_curr}?",
+        # Informal/casual
+        "yo what's the weather like in {city} rn",
+        "bro convert {value} {from_unit} to {to_unit} quick",
+        "how much is {amount} {from_curr} in {to_curr} lol",
+        # Indirect phrasing
+        "I'm traveling to {city}, how's the weather there?",
+        "I need to know the exchange rate for {amount} {from_curr} to {to_curr}",
+        "Can you tell me what {value} {from_unit} is in {to_unit}?",
+        "I want to create a calendar event for '{title}' on {date}",
+    ]
 
+    examples = []
     for _ in range(count):
         city = random.choice(CITIES)
         date = random.choice(DATES)
-        cv, fu, tu = random.choice(CONVERT_PAIRS)
-        am, fc, tc = random.choice(CURRENCY_PAIRS)
+        value, from_unit, to_unit = random.choice(CONVERT_PAIRS)
+        amount, from_curr, to_curr = random.choice(CURRENCY_PAIRS)
         title = random.choice(TITLES)
 
-        template = random.choice(ADVERSARIAL_PROMPTS)
+        template = random.choice(adversarial_inputs)
         try:
             user_msg = template.format(
                 city=city, date=date, title=title,
-                value=cv, from_unit=fu, to_unit=tu,
-                amount=am, from_curr=fc, to_curr=tc,
+                value=value, from_unit=from_unit, to_unit=to_unit,
+                amount=amount, from_curr=from_curr, to_curr=to_curr,
             )
         except KeyError:
-            user_msg = template  # pre-filled template
+            user_msg = template
 
         try:
-            response = client.chat.completions.create(
+            resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
                 ],
-                temperature=0.2,
+                temperature=0.1,
                 max_tokens=150,
             )
-            asst_content = response.choices[0].message.content.strip()
+            asst = resp.choices[0].message.content.strip()
 
-            # Validate: if tool call, must be parseable
-            if "<tool_call>" in asst_content:
-                match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", asst_content, re.DOTALL)
-                if match:
+            # Validate
+            if "<tool_call>" in asst:
+                m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", asst, re.DOTALL)
+                if m:
                     try:
-                        parsed = json.loads(match.group(1))
+                        parsed = json.loads(m.group(1))
                         if parsed.get("tool") not in {"weather", "calendar", "convert", "currency", "sql"}:
                             continue
+                        # Ensure closing tag
+                        if not asst.strip().endswith("</tool_call>"):
+                            asst = asst + "\n</tool_call>"
                     except json.JSONDecodeError:
                         continue
+                else:
+                    continue
 
             examples.append({
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_msg},
-                    {"role": "assistant", "content": asst_content},
+                    {"role": "assistant", "content": asst},
                 ]
             })
         except Exception as e:
-            print(f"  [adversarial] error: {e}")
-            time.sleep(1)
+            print(f"  [adversarial API] error: {e}")
+            time.sleep(0.5)
 
     return examples
 
 
+# ── Validation ────────────────────────────────────────────────────────────────
+
 def validate_dataset(examples: list[dict]) -> tuple[list[dict], int]:
-    """Filter out malformed tool calls."""
     valid = []
     rejected = 0
     valid_tools = {"weather", "calendar", "convert", "currency", "sql"}
 
     for ex in examples:
-        messages = ex.get("messages", [])
         ok = True
-        for msg in messages:
-            if msg["role"] == "assistant":
-                content = msg["content"]
-                if "<tool_call>" in content:
-                    match = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", content, re.DOTALL)
-                    if not match:
+        for msg in ex.get("messages", []):
+            if msg["role"] == "assistant" and "<tool_call>" in msg["content"]:
+                m = re.search(r"<tool_call>\s*(.*?)\s*</tool_call>", msg["content"], re.DOTALL)
+                if not m:
+                    ok = False
+                    break
+                try:
+                    parsed = json.loads(m.group(1))
+                    if parsed.get("tool") not in valid_tools:
                         ok = False
                         break
-                    try:
-                        parsed = json.loads(match.group(1))
-                        if parsed.get("tool") not in valid_tools:
-                            ok = False
-                            break
-                    except json.JSONDecodeError:
-                        ok = False
-                        break
+                except json.JSONDecodeError:
+                    ok = False
+                    break
         if ok:
             valid.append(ex)
         else:
             rejected += 1
-
     return valid, rejected
 
 
-def check_no_overlap_with_public_test(examples: list[dict], public_test_path: Path) -> None:
-    """SHA-256 check: ensure no training prompt matches public test set."""
+def check_no_overlap(examples: list[dict], public_test_path: Path) -> None:
     if not public_test_path.exists():
         print("  [overlap check] public_test.jsonl not found — skipping")
         return
-
     public_hashes = set()
     for line in public_test_path.read_text().splitlines():
         if not line.strip():
             continue
         item = json.loads(line)
-        user_msg = ""
         for m in item.get("messages", []):
             if m["role"] == "user":
-                user_msg = m["content"]
+                public_hashes.add(hashlib.sha256(m["content"].encode()).hexdigest())
                 break
-        public_hashes.add(hashlib.sha256(user_msg.encode()).hexdigest())
-
-    overlaps = 0
-    for ex in examples:
-        for m in ex.get("messages", []):
-            if m["role"] == "user":
-                h = hashlib.sha256(m["content"].encode()).hexdigest()
-                if h in public_hashes:
-                    overlaps += 1
-                break
-
+    overlaps = sum(
+        1 for ex in examples
+        for m in ex.get("messages", [])
+        if m["role"] == "user" and hashlib.sha256(m["content"].encode()).hexdigest() in public_hashes
+    )
     if overlaps:
-        print(f"  WARNING: {overlaps} training examples overlap with public test set!")
+        print(f"  WARNING: {overlaps} training prompts overlap with public test set!")
     else:
         print("  [overlap check] PASSED — zero overlap with public test set")
 
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--count", type=int, default=1500)
     parser.add_argument("--out", default="data/training_data.jsonl")
-    parser.add_argument("--no-api", action="store_true", help="Skip API calls (rule-based only)")
+    parser.add_argument("--no-api", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    random.seed(args.seed)
     out_path = ROOT / args.out
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
     if not api_key and not args.no_api:
-        raise SystemExit("Set OPENAI_API_KEY or use --no-api for rule-based generation only")
+        raise SystemExit("Set OPENAI_API_KEY or pass --no-api")
 
     client = OpenAI(api_key=api_key) if api_key else None
 
-    print("=== Pocket-Agent Data Generation ===")
-    print(f"Target: {args.count} examples → {out_path}")
-
+    print("=== Pocket-Agent Data Generation ===\n")
     all_examples: list[dict] = []
 
-    # Phase 1: Rule-based (free, fast)
-    print("\n[1/3] Generating rule-based examples...")
-    rule_based = generate_rule_based_examples()
-    print(f"  Generated {len(rule_based)} rule-based examples")
-    all_examples.extend(rule_based)
+    # Rule-based (always run — fast, free, correct)
+    print("[1/5] Rule-based tool examples...")
+    rb = (
+        gen_weather(220)
+        + gen_calendar_list(110)
+        + gen_calendar_create(110)
+        + gen_convert(220)
+        + gen_currency(220)
+        + gen_sql(110)
+        + gen_multiturn(180)
+        + gen_adversarial_rulebased()
+        + gen_refusals_rulebased()
+    )
+    print(f"  {len(rb)} rule-based examples")
+    all_examples.extend(rb)
 
-    if not args.no_api and client:
-        # Phase 2: Refusals via API
-        print("\n[2/3] Generating refusal examples via GPT-4o-mini...")
-        refusals = generate_refusal_examples_via_api(client, count=200)
-        print(f"  Generated {len(refusals)} refusal examples")
-        all_examples.extend(refusals)
+    if client and not args.no_api:
+        print("\n[2/5] API: diverse refusal responses...")
+        r = gen_refusals_via_api(client, 120)
+        print(f"  {len(r)} refusal examples")
+        all_examples.extend(r)
 
-        # Phase 3: Adversarial via API
-        print("\n[3/3] Generating adversarial examples via GPT-4o-mini...")
-        adversarial = generate_adversarial_via_api(client, count=150)
-        print(f"  Generated {len(adversarial)} adversarial examples")
-        all_examples.extend(adversarial)
+        print("\n[3/5] API: adversarial / code-switched examples...")
+        a = gen_adversarial_via_api(client, 120)
+        print(f"  {len(a)} adversarial examples")
+        all_examples.extend(a)
     else:
-        print("\n[2/3] Skipping API calls (--no-api flag set)")
-        print("[3/3] Adding rule-based refusal stubs...")
-        # Rule-based refusals without response text (model will learn from context)
-        for _ in range(200):
-            user_msg = random.choice(
-                SLICE_PROMPTS["refusal_chitchat"] + SLICE_PROMPTS["refusal_unknown_tool"]
-            )
-            all_examples.append({
-                "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_msg},
-                    {"role": "assistant", "content": "I'm sorry, I can only help with weather, calendar, unit conversion, currency exchange, and SQL queries."},
-                ]
-            })
+        print("\n[2/5] Skipping API (--no-api). Rule-based only.")
 
-    # Validate
-    print("\n[Validation] Checking tool call JSON integrity...")
-    valid_examples, rejected = validate_dataset(all_examples)
-    print(f"  Valid: {len(valid_examples)}, Rejected: {rejected}")
+    print(f"\n[4/5] Validating {len(all_examples)} examples...")
+    valid, rejected = validate_dataset(all_examples)
+    print(f"  Valid: {len(valid)}, Rejected: {rejected}")
 
-    # Shuffle
-    random.shuffle(valid_examples)
+    random.shuffle(valid)
 
-    # Overlap check
-    print("[Validation] Checking overlap with public test set...")
-    check_no_overlap_with_public_test(valid_examples, ROOT / "data" / "public_test.jsonl")
+    print("[5/5] Overlap check...")
+    check_no_overlap(valid, ROOT / "data" / "public_test.jsonl")
 
-    # Write output
-    with out_path.open("w") as f:
-        for ex in valid_examples:
+    with out_path.open("w", encoding="utf-8") as f:
+        for ex in valid:
             f.write(json.dumps(ex, ensure_ascii=False) + "\n")
 
-    print(f"\n✓ Wrote {len(valid_examples)} examples to {out_path}")
+    print(f"\n✓ Wrote {len(valid)} examples → {out_path}")
     print("\nDistribution:")
     tool_counts: dict[str, int] = {}
     refusal_count = 0
-    for ex in valid_examples:
-        found_tool = False
+    for ex in valid:
+        found = False
         for msg in ex["messages"]:
             if msg["role"] == "assistant" and "<tool_call>" in msg["content"]:
                 m = re.search(r'"tool"\s*:\s*"([^"]+)"', msg["content"])
                 if m:
                     t = m.group(1)
                     tool_counts[t] = tool_counts.get(t, 0) + 1
-                    found_tool = True
+                    found = True
                     break
-        if not found_tool:
+        if not found:
             refusal_count += 1
     for tool, cnt in sorted(tool_counts.items()):
-        print(f"  {tool}: {cnt}")
-    print(f"  refusals: {refusal_count}")
+        print(f"  {tool:10s}: {cnt}")
+    print(f"  {'refusals':10s}: {refusal_count}")
 
 
 if __name__ == "__main__":
