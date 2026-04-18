@@ -733,7 +733,7 @@ def gen_refusals_rulebased() -> list[dict]:
 
 # ── API-based generation (higher diversity) ───────────────────────────────────
 
-def gen_refusals_via_api(client: OpenAI, count: int = 120) -> list[dict]:
+def gen_refusals_via_api(client: OpenAI, count: int = 250) -> list[dict]:
     """GPT-4o-mini generates varied, natural refusal responses."""
     examples = []
     prompts_pool = [
@@ -997,12 +997,12 @@ def main():
 
     if client and not args.no_api:
         print("\n[2/5] API: diverse refusal responses...")
-        r = gen_refusals_via_api(client, 120)
+        r = gen_refusals_via_api(client, 250)
         print(f"  {len(r)} refusal examples")
         all_examples.extend(r)
 
         print("\n[3/5] API: adversarial / code-switched examples...")
-        a = gen_adversarial_via_api(client, 120)
+        a = gen_adversarial_via_api(client, 150)
         print(f"  {len(a)} adversarial examples")
         all_examples.extend(a)
     else:
